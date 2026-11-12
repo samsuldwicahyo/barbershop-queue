@@ -1,0 +1,309 @@
+// ============================================
+// PRISMA SCHEMA: ANTRIAN BARBERSHOP MULTI-TENANT
+// ============================================
+// Database: PostgreSQL
+// Multi-Tenant Strategy: Shared Database, Shared Schema with barbershop_id isolation
+// All queries MUST filter by barbershop_id (except Super Admin operations)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================================
+// ENUMS
+// ============================================
+
+enum UserRole {
+  SUPER_ADMIN   // Akses semua barbershop, manage subscriptions
+  SHOP_ADMIN    // Akses 1 barbershop, manage barbers & settings
+  BARBER        // Akses 1 barbershop, manage bookings assigned to them
+  CUSTOMER      // Public user (via WhatsApp), tidak login ke dashboard
+}
+
+enum SubscriptionStatus {
+  TRIAL         // 14 hari gratis
+  ACTIVE        // Berlangganan aktif
+  EXPIRED       // Jatuh tempo
+  CANCELLED     // Dibatalkan manual
+  SUSPENDED     // Ditangguhkan (misal fraud)
+}
+
+enum BookingStatus {
+  BOOKED                // Customer sudah booking (antri)
+  CALLING               // Barber memanggil customer (broadcast via SSE)
+  CHECKED_IN            // (Opsional) Customer konfirmasi hadir
+  IN_PROGRESS           // Barber sedang mengerjakan
+  DONE                  // Selesai
+  CANCELLED_BY_CUSTOMER // Customer cancel sendiri
+  CANCELLED_BY_SHOP     // Barbershop cancel (misal tutup mendadak)
+  NO_SHOW               // Hangus karena tidak hadir 30 menit setelah CALLING
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+// ============================================
+// TENANT MODEL (BARBERSHOP)
+// ============================================
+
+model Barbershop {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique // URL-friendly: /public/{slug}
+  
+  // Contact & Location
+  phone       String?
+  email       String?
+  address     String?
+  city        String?
+  province    String?
+  latitude    Float?   // Untuk map (future)
+  longitude   Float?
+  
+  // Settings
+  timezone    String   @default("Asia/Jakarta") // IANA timezone
+  isActive    Boolean  @default(true) // Bisa nonaktifkan tenant
+  
+  // Metadata
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // RELATIONS
+  users              User[]
+  barberProfiles     BarberProfile[]
+  operatingHours     OperatingHours[]
+  holidays           Holiday[]
+  bookings           Booking[]
+  subscriptions      Subscription[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@map("barbershops")
+}
+
+// ============================================
+// SUBSCRIPTION MODEL
+// ============================================
+
+model Subscription {
+  id            String             @id @default(cuid())
+  barbershopId  String
+  
+  status        SubscriptionStatus @default(TRIAL)
+  
+  // Trial: 14 hari dari createdAt
+  // Active: startDate s/d endDate
+  startDate     DateTime?          // Null jika masih TRIAL
+  endDate       DateTime?          // Null jika masih TRIAL
+  
+  // Billing (placeholder untuk payment gateway)
+  plan          String?            // "BASIC", "PRO", "ENTERPRISE"
+  price         Int?               // Dalam rupiah (misal: 100000)
+  
+  createdAt     DateTime           @default(now())
+  updatedAt     DateTime           @updatedAt
+  
+  // RELATIONS
+  barbershop    Barbershop         @relation(fields: [barbershopId], references: [id], onDelete: Cascade)
+
+  @@index([barbershopId])
+  @@index([status])
+  @@index([endDate]) // Untuk cek expiry
+  @@map("subscriptions")
+}
+
+// ============================================
+// USER MODEL (MULTI-ROLE)
+// ============================================
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String
+  phone         String?
+  
+  // Role & Tenant
+  role          UserRole @default(CUSTOMER)
+  barbershopId  String?  // NULL untuk SUPER_ADMIN dan CUSTOMER
+  
+  // Auth (placeholder, akan pakai NextAuth/Clerk)
+  passwordHash  String?  // Untuk auth manual (atau pakai OAuth)
+  isActive      Boolean  @default(true)
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // RELATIONS
+  barbershop       Barbershop?     @relation(fields: [barbershopId], references: [id], onDelete: SetNull)
+  barberProfile    BarberProfile?  // One-to-One jika role BARBER
+  bookingsAsBarber Booking[]       @relation("BarberBookings")
+
+  @@index([email])
+  @@index([barbershopId])
+  @@index([role])
+  @@map("users")
+}
+
+// ============================================
+// BARBER PROFILE (EXTENSION USER)
+// ============================================
+
+model BarberProfile {
+  id            String   @id @default(cuid())
+  userId        String   @unique // One-to-One dengan User (role BARBER)
+  barbershopId  String
+  
+  // Barber Info
+  displayName   String   // Nama untuk ditampilkan ke customer
+  avatarUrl     String?
+  bio           String?  @db.Text
+  
+  // Status
+  isAvailable   Boolean  @default(true) // Aktif terima booking atau tidak
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // RELATIONS
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  barbershop    Barbershop @relation(fields: [barbershopId], references: [id], onDelete: Cascade)
+
+  @@index([barbershopId])
+  @@index([isAvailable])
+  @@map("barber_profiles")
+}
+
+// ============================================
+// OPERATING HOURS (JAM BUKA PER HARI)
+// ============================================
+
+model OperatingHours {
+  id            String    @id @default(cuid())
+  barbershopId  String
+  
+  dayOfWeek     DayOfWeek
+  isOpen        Boolean   @default(true) // False = libur rutin (misal: Minggu tutup)
+  
+  openTime      String?   // Format: "09:00" (24h)
+  closeTime     String?   // Format: "21:00" (24h)
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  // RELATIONS
+  barbershop    Barbershop @relation(fields: [barbershopId], references: [id], onDelete: Cascade)
+
+  @@unique([barbershopId, dayOfWeek]) // Satu hari hanya 1 record
+  @@index([barbershopId])
+  @@map("operating_hours")
+}
+
+// ============================================
+// HOLIDAY (TANGGAL LIBUR KHUSUS)
+// ============================================
+
+model Holiday {
+  id            String   @id @default(cuid())
+  barbershopId  String
+  
+  date          DateTime @db.Date // Format: YYYY-MM-DD
+  description   String?  // "Lebaran", "Tahun Baru", dll
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  
+  // RELATIONS
+  barbershop    Barbershop @relation(fields: [barbershopId], references: [id], onDelete: Cascade)
+
+  @@unique([barbershopId, date]) // Satu tanggal hanya 1 record
+  @@index([barbershopId])
+  @@index([date])
+  @@map("holidays")
+}
+
+// ============================================
+// BOOKING (ANTRIAN)
+// ============================================
+
+model Booking {
+  id              String        @id @default(cuid())
+  barbershopId    String        // WAJIB untuk multi-tenant isolation
+  barberId        String        // User.id dengan role BARBER
+  
+  // Customer Info (bisa guest via WhatsApp)
+  customerName    String
+  customerPhone   String
+  customerNotes   String?       @db.Text
+  
+  // Queue Number (reset per hari per barbershop)
+  queueNumber     Int           // Auto-increment per hari
+  bookingDate     DateTime      @db.Date // Format: YYYY-MM-DD
+  
+  // Status & Timing
+  status          BookingStatus @default(BOOKED)
+  
+  calledAt        DateTime?     // Waktu barber klik "PANGGIL"
+  checkedInAt     DateTime?     // (Opsional) Customer konfirmasi hadir
+  inProgressAt    DateTime?     // Barber mulai kerjakan
+  completedAt     DateTime?     // Selesai
+  cancelledAt     DateTime?     // Waktu cancel
+  
+  // Estimasi waktu pengerjaan (input oleh barber)
+  estimatedDurationMinutes Int? // Misal: 30 menit
+  
+  // Metadata
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  
+  // RELATIONS
+  barbershop      Barbershop    @relation(fields: [barbershopId], references: [id], onDelete: Cascade)
+  barber          User          @relation("BarberBookings", fields: [barberId], references: [id], onDelete: Restrict)
+
+  @@unique([barbershopId, bookingDate, queueNumber]) // Nomor antrian unik per hari
+  @@index([barbershopId])
+  @@index([barberId])
+  @@index([bookingDate])
+  @@index([status])
+  @@index([createdAt]) // Untuk sorting realtime
+  @@map("bookings")
+}
+
+// ============================================
+// NOTES:
+// ============================================
+// 1. MULTI-TENANT ISOLATION:
+//    - Semua tabel (kecuali User dengan role SUPER_ADMIN) punya barbershopId
+//    - CUSTOMER tidak punya barbershopId karena bisa booking ke berbagai barbershop
+//    - SUPER_ADMIN tidak punya barbershopId karena manage semua tenant
+//    - Semua query WAJIB filter by barbershopId (kecuali Super Admin)
+//
+// 2. QUEUE NUMBER LOGIC:
+//    - queueNumber auto-increment per barbershopId per bookingDate
+//    - Reset setiap hari (midnight via cron job atau check saat create booking)
+//    - Unique constraint: [barbershopId, bookingDate, queueNumber]
+//
+// 3. NO-SHOW DETECTION:
+//    - Status CALLING -> jika customer tidak checkin dalam 30 menit -> NO_SHOW
+//    - Cron job atau webhook check (calledAt + 30 minutes < now)
+//
+// 4. SUBSCRIPTION CHECK:
+//    - Sebelum create booking, check:
+//      1. Subscription.status == ACTIVE (atau TRIAL jika < 14 hari)
+//      2. OperatingHours.isOpen == true untuk dayOfWeek
+//      3. Holiday.date != bookingDate
+//
+// 5. INDEXES:
+//    - barbershopId: hampir semua tabel (untuk multi-tenant query)
+//    - bookingDate + status: untuk realtime queue query
+//    - createdAt: untuk sorting antrian
